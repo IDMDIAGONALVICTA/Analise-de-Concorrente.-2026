@@ -1469,9 +1469,12 @@ streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', 
             newMarker.openPopup();
             document.getElementById('markerName').value = '';
             loadPOIs(lat, lng);
-            // Carregar dados de consumo
+            // Carregar dados de consumo — usar displayName (Nominatim) + texto digitado para melhor detecção de bairro
             const searchInput = document.getElementById('searchInput').value;
-            displayConsumoAnalysis(lat, lng, searchInput);
+            const addressForAnalysis = (displayName && displayName !== 'Local pesquisado') 
+                ? displayName + ' | ' + searchInput 
+                : searchInput;
+            displayConsumoAnalysis(lat, lng, addressForAnalysis);
         }
         
         function clearSearch() {
@@ -2397,6 +2400,7 @@ let currentConsumoAddress = '';
 let currentConsumoLat = 0;
 let currentConsumoLng = 0;
 let currentConsumoBaseIncome = null; // Renda base do município (não calculada)
+let currentLocalidadeDetectada = ''; // Localidade detectada pelo ponto de pesquisa
 
 // Funções de Abas
 function switchTab(tabName) {
@@ -2462,25 +2466,43 @@ const rendaPorLocalidade = {
     'goiânia': 3100, 'manaus': 2700, 'belém': 2500, 'natal': 2600, 'joão pessoa': 2500
 };
 
+function normalizeStr(str) {
+    return str.toLowerCase().trim()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
 function getRendaPorLocalidade(endereco) {
-    // Normalizar endereço
-    const enderecoLower = endereco.toLowerCase().trim();
-    
-    // Tentar encontrar match exato primeiro
-    if (rendaPorLocalidade[enderecoLower]) {
-        return rendaPorLocalidade[enderecoLower];
-    }
-    
-    // Buscar por bairros/localidades mencionados no endereço
-    for (const [localidade, renda] of Object.entries(rendaPorLocalidade)) {
-        // Verificar se a localidade está contida no endereço
-        if (enderecoLower.includes(localidade) || localidade.includes(enderecoLower)) {
-            return renda;
+    if (!endereco) return null;
+    const enderecoNorm = normalizeStr(endereco);
+
+    if (!getRendaPorLocalidade._cacheNorm) {
+        getRendaPorLocalidade._cacheNorm = {};
+        for (const [loc, renda] of Object.entries(rendaPorLocalidade)) {
+            getRendaPorLocalidade._cacheNorm[normalizeStr(loc)] = renda;
         }
     }
-    
-    // Se não encontrou nada específico, retornar média de Fortaleza (assumindo região metropolitana)
-    return 3200;
+    const cache = getRendaPorLocalidade._cacheNorm;
+
+    // 1. Match exato
+    if (cache[enderecoNorm] !== undefined) return cache[enderecoNorm];
+
+    // 2. Endereço contém a localidade — match mais longo tem prioridade
+    let melhorRenda = null, melhorTamanho = 0;
+    for (const [locNorm, renda] of Object.entries(cache)) {
+        if (enderecoNorm.includes(locNorm) && locNorm.length > melhorTamanho) {
+            melhorRenda = renda;
+            melhorTamanho = locNorm.length;
+        }
+    }
+    if (melhorRenda !== null) return melhorRenda;
+
+    // 3. Localidade contém o endereço
+    for (const [locNorm, renda] of Object.entries(cache)) {
+        if (locNorm.includes(enderecoNorm)) return renda;
+    }
+
+    // Não encontrado — retornar null (não 3200, para não confundir com valor válido)
+    return null;
 }
 
 // Funções de Análise de Consumo IBGE
@@ -2500,77 +2522,110 @@ async function fetchIBGEData(municipality) {
     }
 }
 
+// Tenta encontrar renda para um nome de localidade. Retorna null se não encontrou nada na tabela.
+function buscarRendaNaTabela(nomeLocalidade) {
+    if (!nomeLocalidade || !nomeLocalidade.trim()) return null;
+    const norm = normalizeStr(nomeLocalidade);
+    if (!getRendaPorLocalidade._cacheNorm) {
+        // Garante que o cache esteja construído
+        getRendaPorLocalidade('__init__');
+    }
+    const cache = getRendaPorLocalidade._cacheNorm;
+    // Match exato
+    if (cache[norm] !== undefined) return { renda: cache[norm], local: nomeLocalidade };
+    // Endereço contém a localidade (match mais longo primeiro)
+    let melhor = null, melhorLen = 0;
+    for (const [locNorm, renda] of Object.entries(cache)) {
+        if (norm.includes(locNorm) && locNorm.length > melhorLen) {
+            melhor = { renda, local: locNorm }; melhorLen = locNorm.length;
+        }
+    }
+    return melhor;
+}
+
 async function displayConsumoAnalysis(lat, lng, address) {
     const consumoContent = document.getElementById('consumoContent');
     consumoContent.innerHTML = '<div style="text-align: center; padding: 20px;"><div class="loading-spinner"></div>Carregando dados...</div>';
     try {
         let rendaReal = null;
         let localidadeDetectada = '';
-        
-        // Tentar obter informações detalhadas do CEP
-        const cepMatch = address.match(/\d{5}-?\d{3}/);
-        if (cepMatch) {
-            const cep = cepMatch[0].replace('-', '');
-            try {
-                const cepResponse = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
-                const cepData = await cepResponse.json();
-                
-                if (cepData && !cepData.erro) {
-                    // Priorizar bairro se disponível
-                    if (cepData.bairro) {
-                        localidadeDetectada = cepData.bairro;
-                        rendaReal = getRendaPorLocalidade(cepData.bairro);
-                        console.log(`Renda detectada por bairro (${cepData.bairro}): R$ ${rendaReal}`);
-                    }
-                    
-                    // Se não encontrou renda pelo bairro, tentar pelo município
-                    if (!rendaReal || rendaReal === 3200) {
-                        if (cepData.localidade) {
-                            localidadeDetectada = cepData.localidade;
-                            rendaReal = getRendaPorLocalidade(cepData.localidade);
-                            console.log(`Renda detectada por município (${cepData.localidade}): R$ ${rendaReal}`);
-                        }
+
+        // ─── PASSO 1: Geocodificação reversa via Nominatim (lat/lng → bairro exato)
+        // Esta é a fonte mais confiável pois usa as coordenadas exatas do ponto clicado/pesquisado
+        try {
+            const revGeoUrl = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=16&addressdetails=1`;
+            const revGeoResp = await fetch(revGeoUrl);
+            const revGeoData = await revGeoResp.json();
+            if (revGeoData && revGeoData.address) {
+                const a = revGeoData.address;
+                // Tenta todas as subdivisões do mais específico para o mais geral
+                const candidatos = [
+                    a.suburb, a.neighbourhood, a.quarter, a.city_district,
+                    a.village, a.town, a.city, a.county, a.state_district
+                ].filter(Boolean);
+                console.log('Nominatim reverso candidatos:', candidatos);
+                for (const candidato of candidatos) {
+                    const resultado = buscarRendaNaTabela(candidato);
+                    if (resultado) {
+                        rendaReal = resultado.renda;
+                        localidadeDetectada = resultado.local;
+                        console.log(`✅ Renda detectada (Nominatim reverso): "${candidato}" → R$ ${rendaReal}`);
+                        break;
                     }
                 }
-            } catch (error) {
-                console.error('Erro ao buscar CEP:', error);
+            }
+        } catch (e) { console.warn('Erro geocod. reversa:', e); }
+
+        // ─── PASSO 2: CEP via ViaCEP (caso não encontrou por coordenada)
+        if (!rendaReal) {
+            const cepMatch = address.match(/\d{5}-?\d{3}/);
+            if (cepMatch) {
+                const cep = cepMatch[0].replace('-', '');
+                try {
+                    const cepResp = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
+                    const cepData = await cepResp.json();
+                    if (cepData && !cepData.erro) {
+                        const candidatosCep = [cepData.bairro, cepData.localidade].filter(Boolean);
+                        for (const c of candidatosCep) {
+                            const resultado = buscarRendaNaTabela(c);
+                            if (resultado) {
+                                rendaReal = resultado.renda;
+                                localidadeDetectada = resultado.local;
+                                console.log(`✅ Renda detectada (ViaCEP): "${c}" → R$ ${rendaReal}`);
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) { console.warn('Erro ViaCEP:', e); }
             }
         }
-        
-        // Se não obteve renda pelo CEP, tentar pelo endereço completo
-        if (!rendaReal || rendaReal === 3200) {
-            // Primeiro tentar encontrar bairro no endereço
-            rendaReal = getRendaPorLocalidade(address);
-            localidadeDetectada = address;
-            console.log(`Renda detectada por endereço completo: R$ ${rendaReal}`);
-        }
-        
-        // Fallback: usar API do IBGE para município
-        if (!rendaReal || rendaReal === 3200) {
-            const parts = address.split(',');
-            if (parts.length > 0) {
-                const municipio = parts[parts.length - 1].trim();
-                rendaReal = getRendaPorLocalidade(municipio);
-                localidadeDetectada = municipio;
-                console.log(`Renda detectada por município (fallback): R$ ${rendaReal}`);
+
+        // ─── PASSO 3: Varredura no texto completo do endereço (displayName do Nominatim)
+        if (!rendaReal) {
+            const resultado = buscarRendaNaTabela(address);
+            if (resultado) {
+                rendaReal = resultado.renda;
+                localidadeDetectada = resultado.local;
+                console.log(`✅ Renda detectada (texto endereço): "${resultado.local}" → R$ ${rendaReal}`);
             }
         }
-        
-        // Se ainda não encontrou, usar valor padrão
+
+        // ─── PASSO 4: Fallback — média de Fortaleza
         if (!rendaReal) {
             rendaReal = 3200;
-            localidadeDetectada = 'Região não identificada';
-            console.log('Usando renda padrão: R$ 3.200');
+            if (!localidadeDetectada) localidadeDetectada = 'Região não mapeada (padrão)';
+            console.log('⚠️ Renda não detectada, usando padrão R$ 3.200');
         }
-        
-        console.log(`Localidade: ${localidadeDetectada} | Renda Base: R$ ${rendaReal}`);
-        
+
+        console.log(`📍 Localidade final: "${localidadeDetectada}" | Renda Base: R$ ${rendaReal}`);
+
         const consumoData = generateConsumoData(null, 2000, rendaReal);
         currentConsumoData = consumoData;
         currentConsumoAddress = address;
         currentConsumoLat = lat;
         currentConsumoLng = lng;
-        currentConsumoBaseIncome = rendaReal; // Armazenar renda base do município/bairro
+        currentConsumoBaseIncome = rendaReal;
+        currentLocalidadeDetectada = localidadeDetectada;
         renderConsumoAnalysis(consumoData);
     } catch (error) {
         console.error('Erro ao processar análise de consumo:', error);
@@ -2582,36 +2637,73 @@ function generateConsumoData(municipalityData, radius = 2000, rendaReal = null) 
     const radiusMultiplier = radius === 2000 ? 0.3 : radius === 5000 ? 0.7 : 1.0;
     const baseFamilies = 8000;
     const families = Math.round(baseFamilies * radiusMultiplier + (Math.random() * baseFamilies * 0.2));
+
+    // Renda base diretamente do endereço pesquisado
     const baseIncome = rendaReal ? rendaReal : (1800 + Math.random() * 4200);
-    const incomeDist = calculateIncomeDistributionByBase(baseIncome);
-    const distForRadius = radius === 2000 ? incomeDist.income2km : radius === 5000 ? incomeDist.income5km : incomeDist.income8km;
-    const avgIncome = calculateAvgIncomeFromDistribution(distForRadius);
+
+    // Ajuste de renda média por raio: áreas maiores tendem a diluir a renda
+    // (quanto maior o raio, maior a chance de abranger bairros de menor renda)
+    const radiusIncomeAdjust = radius === 2000 ? 1.0 : radius === 5000 ? 0.88 : 0.78;
+    const avgIncome = Math.round(baseIncome * radiusIncomeAdjust);
+
     const avgConsumption = avgIncome * 0.6;
+
+    // Distribuição de classes socioeconômicas baseada na renda do ponto pesquisado
+    let classeDist;
+    if (baseIncome > 6000) {
+        classeDist = { A: 0.18, B: 0.32, C: 0.33, D: 0.13, E: 0.04 };
+    } else if (baseIncome > 4000) {
+        classeDist = { A: 0.08, B: 0.22, C: 0.40, D: 0.24, E: 0.06 };
+    } else if (baseIncome > 2500) {
+        classeDist = { A: 0.03, B: 0.10, C: 0.42, D: 0.35, E: 0.10 };
+    } else {
+        classeDist = { A: 0.01, B: 0.05, C: 0.28, D: 0.42, E: 0.24 };
+    }
+
+    // Distribuição de empreendimentos baseada na renda real do ponto pesquisado
+    let empDist;
+    if (baseIncome > 10000) {
+        empDist = { vitoria: 0.04, viver: 0.12, vista: 0.30, inc: 0.54 };
+    } else if (baseIncome > 6000) {
+        empDist = { vitoria: 0.08, viver: 0.22, vista: 0.38, inc: 0.32 };
+    } else if (baseIncome > 4000) {
+        empDist = { vitoria: 0.15, viver: 0.38, vista: 0.32, inc: 0.15 };
+    } else if (baseIncome > 2500) {
+        empDist = { vitoria: 0.28, viver: 0.42, vista: 0.22, inc: 0.08 };
+    } else {
+        empDist = { vitoria: 0.48, viver: 0.35, vista: 0.12, inc: 0.05 };
+    }
+
+    // Custo de vida proporcional à renda da região
+    const incomeRatio = baseIncome / 3200; // 3200 = referência média Fortaleza
+    const costOfLifeDetails = {
+        alimentacao: Math.round((450 + Math.random() * 150) * incomeRatio),
+        transporte: Math.round((200 + Math.random() * 100) * incomeRatio),
+        lazer: Math.round((150 + Math.random() * 100) * incomeRatio),
+        aluguel: Math.round((800 + Math.random() * 400) * incomeRatio)
+    };
+
     return {
         radius: radius,
         radiusKm: radius / 1000,
         potentialConsumption: avgConsumption * families,
         families: families,
         avgFamilyIncome: avgIncome,
+        rendaBaseLocal: baseIncome, // renda exata do ponto pesquisado
         perCapitaIncome: Math.round(avgIncome / 3.2),
-        classA: Math.round(families * 0.06),
-        classB: Math.round(families * 0.18),
-        classC: Math.round(families * 0.50),
-        classD: Math.round(families * 0.22),
-        classE: Math.round(families * 0.04),
+        classA: Math.round(families * classeDist.A),
+        classB: Math.round(families * classeDist.B),
+        classC: Math.round(families * classeDist.C),
+        classD: Math.round(families * classeDist.D),
+        classE: Math.round(families * classeDist.E),
         costOfLiving: 4.8 + Math.random() * 2.5,
         populationDensity: Math.round(families * 2.5 / (Math.PI * Math.pow(radius / 1000, 2))),
-        costOfLifeDetails: {
-            alimentacao: 450 + Math.random() * 150,
-            transporte: 200 + Math.random() * 100,
-            lazer: 150 + Math.random() * 100,
-            aluguel: 800 + Math.random() * 400
-        },
+        costOfLifeDetails: costOfLifeDetails,
         empreendimentos: {
-            vitoria: Math.round(families * 0.25),
-            viver: Math.round(families * 0.35),
-            vista: Math.round(families * 0.28),
-            inc: Math.round(families * 0.12)
+            vitoria: Math.round(families * empDist.vitoria),
+            viver: Math.round(families * empDist.viver),
+            vista: Math.round(families * empDist.vista),
+            inc: Math.round(families * empDist.inc)
         }
     };
 }
@@ -2666,10 +2758,13 @@ function renderConsumoAnalysis(data) {
         <div style="background: linear-gradient(135deg, #F0F5CD 0%, #E8F5E9 100%); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #007C27;">
             <div style="display: flex; align-items: center; gap: 10px;">
                 <span style="font-size: 24px;">📍</span>
-                <div>
+                <div style="flex: 1;">
                     <p style="margin: 0; color: #00512A; font-weight: bold; font-size: 14px;">Localidade Analisada</p>
                     <p style="margin: 0; color: #666; font-size: 13px;">${currentConsumoAddress || 'Não identificado'}</p>
-                    <p style="margin: 5px 0 0 0; color: #007C27; font-weight: bold; font-size: 13px;">💰 Renda Base Regional: R$ ${(currentConsumoBaseIncome || 3200).toLocaleString('pt-BR')}</p>
+                    <div style="display: flex; gap: 15px; margin-top: 6px; flex-wrap: wrap;">
+                        <p style="margin: 0; color: #007C27; font-weight: bold; font-size: 13px;">💰 Renda do Ponto: R$ ${(data.rendaBaseLocal || currentConsumoBaseIncome || 3200).toLocaleString('pt-BR')}/mês</p>
+                        ${currentLocalidadeDetectada ? `<p style="margin: 0; color: #555; font-size: 12px; background: rgba(0,124,39,0.1); padding: 2px 8px; border-radius: 10px;">🏘️ ${currentLocalidadeDetectada}</p>` : ''}
+                    </div>
                 </div>
             </div>
         </div>
@@ -2695,7 +2790,8 @@ function renderConsumoAnalysis(data) {
             <div class="consumo-card">
                 <h3>Renda Média Familiar</h3>
                 <div class="value">R$ ${data.avgFamilyIncome.toLocaleString('pt-BR', {maximumFractionDigits: 0})}</div>
-                <div class="unit">Mensal</div>
+                <div class="unit">Mensal (raio ${data.radiusKm}km)</div>
+                <div style="margin-top: 6px; font-size: 11px; color: #007C27; font-weight: bold;">📍 Local: R$ ${(data.rendaBaseLocal || currentConsumoBaseIncome || 3200).toLocaleString('pt-BR')}</div>
             </div>
             <div class="consumo-card">
                 <h3>Renda Per Capita</h3>
